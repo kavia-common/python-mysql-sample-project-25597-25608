@@ -1,132 +1,210 @@
 #!/usr/bin/env python3
-"""Initialize SQLite database for database"""
+"""
+Initialize SQLite database schema and seed data for the database container.
 
-import sqlite3
+Requirements implemented:
+- Read SQLite database file path from db_connection.txt (single source of truth).
+- Create a `users` table (id, name, email, created_at).
+- Idempotent: safe to re-run (CREATE TABLE IF NOT EXISTS + seed only if empty).
+- Simple CLI entry: `python init_db.py` with status messages.
+"""
+
+from __future__ import annotations
+
 import os
+import re
+import sqlite3
+import sys
+from typing import Optional, Sequence, Tuple
 
-DB_NAME = "myapp.db"
-DB_USER = "kaviasqlite"  # Not used for SQLite, but kept for consistency
-DB_PASSWORD = "kaviadefaultpassword"  # Not used for SQLite, but kept for consistency
-DB_PORT = "5000"  # Not used for SQLite, but kept for consistency
 
-print("Starting SQLite setup...")
+def _extract_db_path_from_db_connection_file(contents: str) -> Optional[str]:
+    """
+    Parse db_connection.txt contents and return the SQLite file path if found.
 
-# Check if database already exists
-db_exists = os.path.exists(DB_NAME)
-if db_exists:
-    print(f"SQLite database already exists at {DB_NAME}")
-    # Verify it's accessible
+    Expected to find a line like:
+      # File path: /abs/path/to/myapp.db
+    Or alternatively a connection string like:
+      # Connection string: sqlite:////abs/path/to/myapp.db
+    """
+    # Prefer explicit file path line.
+    m = re.search(r"^\s*#\s*File path:\s*(.+?)\s*$", contents, flags=re.MULTILINE)
+    if m:
+        return m.group(1).strip()
+
+    # Fallback: parse sqlite URI line.
+    m = re.search(r"^\s*#\s*Connection string:\s*(sqlite:/{2,}.+?)\s*$", contents, flags=re.MULTILINE)
+    if m:
+        uri = m.group(1).strip()
+        # Common form used in the repo: sqlite:////abs/path/to/file.db
+        # Strip scheme and leading slashes carefully.
+        # sqlite:////abs/path -> path is /abs/path
+        if uri.startswith("sqlite:////"):
+            return "/" + uri[len("sqlite:////") :].lstrip("/")
+        if uri.startswith("sqlite:///"):
+            return uri[len("sqlite:///") :]
+        return uri
+
+    return None
+
+
+# PUBLIC_INTERFACE
+def get_db_path(db_connection_file: str = "db_connection.txt") -> str:
+    """Read db_connection.txt and return the absolute path to the SQLite database file."""
+    if not os.path.exists(db_connection_file):
+        raise FileNotFoundError(
+            f"Required file '{db_connection_file}' not found. "
+            "This file must contain the authoritative SQLite DB path."
+        )
+
+    with open(db_connection_file, "r", encoding="utf-8") as f:
+        contents = f.read()
+
+    db_path = _extract_db_path_from_db_connection_file(contents)
+    if not db_path:
+        raise ValueError(
+            f"Could not determine SQLite DB path from '{db_connection_file}'. "
+            "Expected a line like '# File path: /abs/path/to/myapp.db'."
+        )
+
+    # Keep db_connection.txt as source of truth; we normalize only for usage.
+    db_path = os.path.expanduser(db_path)
+    db_path = os.path.abspath(db_path)
+    return db_path
+
+
+def _ensure_parent_dir(db_path: str) -> None:
+    """Ensure the database directory exists (SQLite will create the file, but not the directory)."""
+    parent = os.path.dirname(db_path)
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+
+
+def _create_schema(conn: sqlite3.Connection) -> None:
+    """Create required tables (idempotent)."""
+    cur = conn.cursor()
+
+    # Keep minimal, focused schema per request.
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # Helpful index for lookup by email (unique already implies index in SQLite,
+    # but we leave schema minimal and rely on UNIQUE constraint).
+    conn.commit()
+
+
+def _table_row_count(conn: sqlite3.Connection, table: str) -> int:
+    cur = conn.cursor()
+    cur.execute(f"SELECT COUNT(*) FROM {table}")
+    return int(cur.fetchone()[0])
+
+
+def _seed_users_if_empty(conn: sqlite3.Connection) -> int:
+    """Seed a few sample users only if the users table is empty. Returns number inserted."""
+    existing = _table_row_count(conn, "users")
+    if existing > 0:
+        return 0
+
+    seed_rows: Sequence[Tuple[str, str]] = [
+        ("Alice Johnson", "alice@example.com"),
+        ("Bob Smith", "bob@example.com"),
+        ("Charlie Lee", "charlie@example.com"),
+    ]
+
+    cur = conn.cursor()
+    # Use INSERT OR IGNORE to remain safe even if the table had rows inserted concurrently.
+    cur.executemany(
+        "INSERT OR IGNORE INTO users (name, email) VALUES (?, ?)",
+        seed_rows,
+    )
+    conn.commit()
+
+    # SQLite cursor.rowcount for executemany is driver-dependent; compute inserted count.
+    after = _table_row_count(conn, "users")
+    return max(0, after - existing)
+
+
+def _print_db_summary(conn: sqlite3.Connection) -> None:
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    )
+    tables = [r[0] for r in cur.fetchall()]
+    print(f"Tables present ({len(tables)}): {', '.join(tables) if tables else '(none)'}")
+
+    if "users" in tables:
+        cur.execute("SELECT COUNT(*) FROM users")
+        users_count = int(cur.fetchone()[0])
+        print(f"users rows: {users_count}")
+
+
+# PUBLIC_INTERFACE
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """
+    CLI entrypoint for initializing the SQLite database.
+
+    Run:
+      python init_db.py
+
+    Returns:
+      Process exit code (0 success, non-zero on error).
+    """
+    argv = argv if argv is not None else sys.argv[1:]
+
+    # Simple CLI: no flags required (by request). We keep argv for future extension.
+    if argv and argv[0] in ("-h", "--help"):
+        print("Usage: python init_db.py\n\nInitializes SQLite schema and seeds sample users if empty.")
+        return 0
+
+    print("Starting SQLite database initialization...")
+
     try:
-        conn = sqlite3.connect(DB_NAME)
-        conn.execute("SELECT 1")
-        conn.close()
-        print("Database is accessible and working.")
+        db_path = get_db_path("db_connection.txt")
     except Exception as e:
-        print(f"Warning: Database exists but may be corrupted: {e}")
-else:
-    print("Creating new SQLite database...")
+        print(f"ERROR: {e}")
+        return 2
 
-# Create database with sample tables
-conn = sqlite3.connect(DB_NAME)
-cursor = conn.cursor()
+    _ensure_parent_dir(db_path)
+    print(f"Using SQLite database file: {db_path}")
 
-# Create initial schema
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS app_info (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        key TEXT UNIQUE NOT NULL,
-        value TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+    try:
+        conn = sqlite3.connect(db_path)
+        # Ensure constraint enforcement.
+        conn.execute("PRAGMA foreign_keys = ON")
 
-# Create a sample users table as an example
-cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        email TEXT UNIQUE NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-""")
+        print("Creating schema (idempotent)...")
+        _create_schema(conn)
+        print("✓ Schema ensured")
 
-# Insert initial data
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("project_name", "database"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("version", "0.1.0"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("author", "John Doe"))
-cursor.execute("INSERT OR REPLACE INTO app_info (key, value) VALUES (?, ?)", 
-               ("description", ""))
+        print("Seeding sample users if table is empty...")
+        inserted = _seed_users_if_empty(conn)
+        if inserted > 0:
+            print(f"✓ Seeded {inserted} sample user(s)")
+        else:
+            print("✓ Users table already has data; no seeding needed")
 
-conn.commit()
+        print("\nDatabase status:")
+        _print_db_summary(conn)
 
-# Get database statistics
-cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-table_count = cursor.fetchone()[0]
+        conn.close()
+        print("\nSQLite initialization complete.")
+        return 0
 
-cursor.execute("SELECT COUNT(*) FROM app_info")
-record_count = cursor.fetchone()[0]
+    except sqlite3.Error as e:
+        print(f"ERROR: SQLite error: {e}")
+        return 3
+    except Exception as e:
+        print(f"ERROR: Unexpected error: {e}")
+        return 4
 
-conn.close()
 
-# Save connection information to a file
-current_dir = os.getcwd()
-connection_string = f"sqlite:///{current_dir}/{DB_NAME}"
-
-try:
-    with open("db_connection.txt", "w") as f:
-        f.write(f"# SQLite connection methods:\n")
-        f.write(f"# Python: sqlite3.connect('{DB_NAME}')\n")
-        f.write(f"# Connection string: {connection_string}\n")
-        f.write(f"# File path: {current_dir}/{DB_NAME}\n")
-    print("Connection information saved to db_connection.txt")
-except Exception as e:
-    print(f"Warning: Could not save connection info: {e}")
-
-# Create environment variables file for Node.js viewer
-db_path = os.path.abspath(DB_NAME)
-
-# Ensure db_visualizer directory exists
-if not os.path.exists("db_visualizer"):
-    os.makedirs("db_visualizer", exist_ok=True)
-    print("Created db_visualizer directory")
-
-try:
-    with open("db_visualizer/sqlite.env", "w") as f:
-        f.write(f"export SQLITE_DB=\"{db_path}\"\n")
-    print(f"Environment variables saved to db_visualizer/sqlite.env")
-except Exception as e:
-    print(f"Warning: Could not save environment variables: {e}")
-
-print("\nSQLite setup complete!")
-print(f"Database: {DB_NAME}")
-print(f"Location: {current_dir}/{DB_NAME}")
-print("")
-
-print("To use with Node.js viewer, run: source db_visualizer/sqlite.env")
-
-print("\nTo connect to the database, use one of the following methods:")
-print(f"1. Python: sqlite3.connect('{DB_NAME}')")
-print(f"2. Connection string: {connection_string}")
-print(f"3. Direct file access: {current_dir}/{DB_NAME}")
-print("")
-
-print("Database statistics:")
-print(f"  Tables: {table_count}")
-print(f"  App info records: {record_count}")
-
-# If sqlite3 CLI is available, show how to use it
-try:
-    import subprocess
-    result = subprocess.run(['which', 'sqlite3'], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("")
-        print("SQLite CLI is available. You can also use:")
-        print(f"  sqlite3 {DB_NAME}")
-except:
-    pass
-
-# Exit successfully
-print("\nScript completed successfully.")
+if __name__ == "__main__":
+    raise SystemExit(main())
