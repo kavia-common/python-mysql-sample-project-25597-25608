@@ -1,4 +1,20 @@
-# SQLite connection methods:
-# Python: sqlite3.connect('myapp.db')
-# Connection string: sqlite:////home/kavia/workspace/code-generation/python-mysql-sample-project-25597-25608/database/myapp.db
-# File path: /home/kavia/workspace/code-generation/python-mysql-sample-project-25597-25608/database/myapp.db
+# Authoritative SQLite DB path for this repository
+# ------------------------------------------------
+# This file is the single source of truth for where the SQLite database file lives.
+# All scripts (init_db.py, db_shell.py, backend service, db_visualizer) should read
+# the DB file path from here to ensure they all open the exact same database.
+#
+# Format rules:
+# - First non-empty, non-comment line is treated as the DB file path.
+# - Use a relative path (recommended) or an absolute path.
+#
+# Example usage:
+# - Python: sqlite3.connect(db_path)
+# - CLI:    sqlite3 "<db_path>"
+#
+# Recommended repo-consistent default (relative to this database/ folder):
+./myapp.db
+
+# Notes:
+# - If you change the path above, re-run: python init_db.py
+# - Backend should also read this file (or use SQLITE_DB env var pointing to the same path).
