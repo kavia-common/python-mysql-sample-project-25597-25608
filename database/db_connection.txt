@@ -1,0 +1,4 @@
+# SQLite connection methods:
+# Python: sqlite3.connect('myapp.db')
+# Connection string: sqlite:////home/kavia/workspace/code-generation/python-mysql-sample-project-25597-25608/database/myapp.db
+# File path: /home/kavia/workspace/code-generation/python-mysql-sample-project-25597-25608/database/myapp.db
